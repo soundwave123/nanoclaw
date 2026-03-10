@@ -1,9 +1,19 @@
+import { existsSync } from 'fs';
+import os from 'os';
+import path from 'path';
 import net from 'net';
 
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { isAudioContentType, transcribeAudio } from '../transcriber.js';
 import { Channel, OnChatMetadata, OnInboundMessage } from '../types.js';
 import { ChannelOpts, registerChannel } from './registry.js';
+
+/** Default directory where signal-cli stores received attachments */
+const SIGNAL_ATTACHMENTS_DIR = path.join(
+  os.homedir(),
+  '.local/share/signal-cli/attachments',
+);
 
 const envCfg = readEnvFile([
   'SIGNAL_PHONE_NUMBER',
@@ -38,6 +48,30 @@ function toJid(identifier: string): string {
 
 function fromJid(jid: string): string {
   return jid.slice(JID_PREFIX.length);
+}
+
+/**
+ * Resolve an attachment object to a local filesystem path.
+ * signal-cli may provide an absolute storedFilename or just a basename.
+ */
+function resolveAttachmentPath(attachment: Record<string, unknown>): string | null {
+  const stored = attachment.storedFilename ?? attachment.filename ?? attachment.id;
+  if (typeof stored !== 'string' || !stored) return null;
+
+  if (path.isAbsolute(stored)) {
+      return existsSync(stored) ? stored : null;
+  }
+
+  // Try with and without the content-type-derived extension
+  const candidates = [
+    path.join(SIGNAL_ATTACHMENTS_DIR, stored),
+    // signal-cli sometimes stores as <id> without extension; try common audio exts
+    path.join(SIGNAL_ATTACHMENTS_DIR, `${stored}.m4a`),
+    path.join(SIGNAL_ATTACHMENTS_DIR, `${stored}.ogg`),
+    path.join(SIGNAL_ATTACHMENTS_DIR, `${stored}.aac`),
+  ];
+
+  return candidates.find(existsSync) ?? null;
 }
 
 class SignalChannel implements Channel {
@@ -186,12 +220,14 @@ class SignalChannel implements Channel {
     if (msg.method === 'receive') {
       const params = msg.params as Record<string, unknown> | undefined;
       if (params?.envelope) {
-        this.handleEnvelope(params.envelope as Record<string, unknown>);
+        this.handleEnvelope(params.envelope as Record<string, unknown>).catch((err) =>
+          logger.error({ err }, 'Signal: error handling envelope'),
+        );
       }
     }
   }
 
-  private handleEnvelope(envelope: Record<string, unknown>): void {
+  private async handleEnvelope(envelope: Record<string, unknown>): Promise<void> {
     // Regular incoming message from another party
     const dm = envelope.dataMessage as Record<string, unknown> | undefined;
     // Sync message: copy of a message sent from the primary device
@@ -200,7 +236,29 @@ class SignalChannel implements Channel {
 
     // Resolve message body from whichever field is present
     const msgBody = dm ?? sent;
-    if (!msgBody?.message || typeof msgBody.message !== 'string') return;
+
+    // Determine message text — either the text body or a transcribed voice message
+    let messageText = typeof msgBody?.message === 'string' ? msgBody.message : '';
+
+    if (!messageText) {
+      const attachments = msgBody?.attachments as
+        | Array<Record<string, unknown>>
+        | undefined;
+      const audio = attachments?.find(
+        (a) => typeof a.contentType === 'string' && isAudioContentType(a.contentType),
+      );
+      if (audio) {
+        const filePath = resolveAttachmentPath(audio);
+        if (filePath) {
+          const transcription = await transcribeAudio(filePath);
+          if (transcription) messageText = transcription;
+        } else {
+          logger.warn({ audio }, 'Signal: audio attachment file not found');
+        }
+      }
+    }
+
+    if (!messageText) return;
 
     const source =
       (envelope.source as string) || (envelope.sourceNumber as string) || '';
@@ -215,7 +273,7 @@ class SignalChannel implements Channel {
 
     if (!chatNumber) return;
 
-    const groupInfo = msgBody.groupInfo as Record<string, unknown> | undefined;
+    const groupInfo = msgBody?.groupInfo as Record<string, unknown> | undefined;
     const groupId =
       typeof groupInfo?.groupId === 'string' ? groupInfo.groupId : null;
 
@@ -243,7 +301,7 @@ class SignalChannel implements Channel {
       chat_jid: jid,
       sender: effectiveSource,
       sender_name: sourceName,
-      content: msgBody.message,
+      content: messageText,
       timestamp,
       is_from_me: isFromMe,
     });
@@ -280,7 +338,10 @@ class SignalChannel implements Channel {
         if (Array.isArray(result)) {
           for (const item of result) {
             const env = (item as Record<string, unknown>).envelope;
-            if (env) this.handleEnvelope(env as Record<string, unknown>);
+            if (env)
+              this.handleEnvelope(env as Record<string, unknown>).catch((err) =>
+                logger.error({ err }, 'Signal: error handling polled envelope'),
+              );
           }
         }
       } catch {
