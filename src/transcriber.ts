@@ -16,7 +16,8 @@ import { logger } from './logger.js';
 
 const envCfg = readEnvFile(['WHISPER_MODEL']);
 
-const WHISPER_MODEL = process.env.WHISPER_MODEL || envCfg.WHISPER_MODEL || 'small';
+const WHISPER_MODEL =
+  process.env.WHISPER_MODEL || envCfg.WHISPER_MODEL || 'small';
 const TRANSCRIBE_TIMEOUT_MS = 120_000;
 
 /** Audio MIME types we attempt to transcribe */
@@ -42,7 +43,9 @@ export function isAudioContentType(contentType: string): boolean {
  * Transcribe an audio file to text using Whisper.
  * Returns null if transcription fails or produces no output.
  */
-export async function transcribeAudio(filePath: string): Promise<string | null> {
+export async function transcribeAudio(
+  filePath: string,
+): Promise<string | null> {
   const tmpDir = os.tmpdir();
   const basename = path.basename(filePath, path.extname(filePath));
   const outFile = path.join(tmpDir, `${basename}.txt`);
@@ -54,21 +57,31 @@ export async function transcribeAudio(filePath: string): Promise<string | null> 
       'whisper',
       [
         filePath,
-        '--model', WHISPER_MODEL,
-        '--output_format', 'txt',
-        '--output_dir', tmpDir,
-        '--fp16', 'False',
-        '--verbose', 'False',
+        '--model',
+        WHISPER_MODEL,
+        '--output_format',
+        'txt',
+        '--output_dir',
+        tmpDir,
+        '--fp16',
+        'False',
+        '--verbose',
+        'False',
       ],
       { timeout: TRANSCRIBE_TIMEOUT_MS },
     );
 
     let stderr = '';
-    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => {
+      stderr += d.toString();
+    });
 
     proc.on('close', (code) => {
       if (code !== 0) {
-        logger.warn({ code, stderr: stderr.slice(-200) }, 'Transcriber: whisper exited with error');
+        logger.warn(
+          { code, stderr: stderr.slice(-200) },
+          'Transcriber: whisper exited with error',
+        );
         resolve(null);
         return;
       }
@@ -88,7 +101,10 @@ export async function transcribeAudio(filePath: string): Promise<string | null> 
     });
 
     proc.on('error', (err) => {
-      logger.warn({ err }, 'Transcriber: failed to start whisper (is it installed?)');
+      logger.warn(
+        { err },
+        'Transcriber: failed to start whisper (is it installed?)',
+      );
       resolve(null);
     });
   });

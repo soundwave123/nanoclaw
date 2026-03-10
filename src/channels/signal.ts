@@ -54,12 +54,15 @@ function fromJid(jid: string): string {
  * Resolve an attachment object to a local filesystem path.
  * signal-cli may provide an absolute storedFilename or just a basename.
  */
-function resolveAttachmentPath(attachment: Record<string, unknown>): string | null {
-  const stored = attachment.storedFilename ?? attachment.filename ?? attachment.id;
+function resolveAttachmentPath(
+  attachment: Record<string, unknown>,
+): string | null {
+  const stored =
+    attachment.storedFilename ?? attachment.id ?? attachment.filename;
   if (typeof stored !== 'string' || !stored) return null;
 
   if (path.isAbsolute(stored)) {
-      return existsSync(stored) ? stored : null;
+    return existsSync(stored) ? stored : null;
   }
 
   // Try with and without the content-type-derived extension
@@ -220,14 +223,16 @@ class SignalChannel implements Channel {
     if (msg.method === 'receive') {
       const params = msg.params as Record<string, unknown> | undefined;
       if (params?.envelope) {
-        this.handleEnvelope(params.envelope as Record<string, unknown>).catch((err) =>
-          logger.error({ err }, 'Signal: error handling envelope'),
+        this.handleEnvelope(params.envelope as Record<string, unknown>).catch(
+          (err) => logger.error({ err }, 'Signal: error handling envelope'),
         );
       }
     }
   }
 
-  private async handleEnvelope(envelope: Record<string, unknown>): Promise<void> {
+  private async handleEnvelope(
+    envelope: Record<string, unknown>,
+  ): Promise<void> {
     // Regular incoming message from another party
     const dm = envelope.dataMessage as Record<string, unknown> | undefined;
     // Sync message: copy of a message sent from the primary device
@@ -238,14 +243,17 @@ class SignalChannel implements Channel {
     const msgBody = dm ?? sent;
 
     // Determine message text — either the text body or a transcribed voice message
-    let messageText = typeof msgBody?.message === 'string' ? msgBody.message : '';
+    let messageText =
+      typeof msgBody?.message === 'string' ? msgBody.message : '';
 
     if (!messageText) {
       const attachments = msgBody?.attachments as
         | Array<Record<string, unknown>>
         | undefined;
       const audio = attachments?.find(
-        (a) => typeof a.contentType === 'string' && isAudioContentType(a.contentType),
+        (a) =>
+          typeof a.contentType === 'string' &&
+          isAudioContentType(a.contentType),
       );
       if (audio) {
         const filePath = resolveAttachmentPath(audio);
@@ -360,6 +368,15 @@ class SignalChannel implements Channel {
     const params = isGroup
       ? { groupId: identifier.slice('group.'.length), message: text }
       : { recipient: [identifier], message: text };
+    await this.rpc('send', params);
+  }
+
+  async sendAudio(jid: string, filePath: string): Promise<void> {
+    const identifier = fromJid(jid);
+    const isGroup = identifier.startsWith('group.');
+    const params = isGroup
+      ? { groupId: identifier.slice('group.'.length), message: '', attachments: [filePath] }
+      : { recipient: [identifier], message: '', attachments: [filePath] };
     await this.rpc('send', params);
   }
 

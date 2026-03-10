@@ -18,6 +18,7 @@ import {
   queryLocalRouter,
 } from './local-router.js';
 import { searchWeb } from './web-search.js';
+import { synthesizeAndCleanup } from './tts.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -82,6 +83,37 @@ const pendingClarifications = new Map<
   string,
   { originalPrompt: string; question: string }
 >();
+
+const VOICE_TRIGGERS = [
+  /\bsay\s+.+/i,
+  /\btalk\s+to\s+me\b/i,
+  /\bspeak\s+to\s+me\b/i,
+  /\brespond\s+with\s+voice\b/i,
+  /\bsend\s+a?\s*voice\s+(message|reply|response)\b/i,
+  /\bread\s+(this\s+)?out\s+loud\b/i,
+  /\bvoice\s+message\s+me\b/i,
+];
+
+/** Returns true if any recent user message is explicitly requesting a voice response. */
+function wantsVoiceResponse(messages: { content: string; is_from_me?: boolean }[]): boolean {
+  const userMessages = messages.filter((m) => !m.is_from_me);
+  const latest = userMessages[userMessages.length - 1]?.content ?? '';
+  const stripped = latest.replace(TRIGGER_PATTERN, '').trim();
+  return VOICE_TRIGGERS.some((re) => re.test(stripped));
+}
+
+/** Synthesize text and send as audio via a channel that supports sendAudio. */
+async function sendVoiceReply(
+  channel: import('./types.js').Channel,
+  chatJid: string,
+  text: string,
+): Promise<void> {
+  if (!channel.sendAudio) return;
+  const audioFile = await synthesizeAndCleanup(text);
+  if (audioFile) {
+    await channel.sendAudio(chatJid, audioFile);
+  }
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -196,6 +228,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // claudePrompt may be overridden with enriched context when clarification was collected.
   let claudePrompt = prompt;
 
+  const wantsVoice = wantsVoiceResponse(missedMessages);
+
   if (LOCAL_ROUTER_ENABLED) {
     const channel = findChannel(channels, chatJid);
     const pending = pendingClarifications.get(chatJid);
@@ -222,6 +256,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           chatJid,
           `${routerResult.text}\n\n${LOCAL_LABEL}`,
         );
+        if (wantsVoice) await sendVoiceReply(channel, chatJid, routerResult.text);
         lastAgentTimestamp[chatJid] =
           missedMessages[missedMessages.length - 1].timestamp;
         saveState();
@@ -305,6 +340,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
         if (text) {
           await channel.sendMessage(chatJid, `${text}\n\n${CLAUDE_LABEL}`);
+          if (wantsVoice) await sendVoiceReply(channel, chatJid, text);
           outputSentToUser = true;
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
