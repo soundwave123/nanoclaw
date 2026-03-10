@@ -84,12 +84,25 @@ export type RouterResult =
   | { type: 'escalate' };
 
 /**
+ * Extract plain-text messages from the XML-formatted prompt.
+ * Qwen gets confused by raw XML — we give it just the conversation text.
+ */
+function extractPlainText(xmlPrompt: string): string {
+  // Pull all <message ...>content</message> blocks and join them
+  const matches = [...xmlPrompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
+  if (matches.length === 0) return xmlPrompt; // fallback: pass as-is
+  return matches.map((m) => m[1].trim()).join('\n');
+}
+
+/**
  * Ask the local model what to do with this conversation.
  */
 export async function queryLocalRouter(
   conversationText: string,
 ): Promise<RouterResult> {
   if (!LOCAL_ROUTER_ENABLED) return { type: 'escalate' };
+
+  const plainText = extractPlainText(conversationText);
 
   try {
     const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -101,16 +114,16 @@ export async function queryLocalRouter(
         options: { temperature: 0.7, num_predict: 512 },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: conversationText },
+          { role: 'user', content: plainText },
         ],
       }),
       signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
-      logger.debug(
+      logger.warn(
         { status: res.status },
-        'Local router: Ollama error, escalating',
+        'Local router: Ollama error, escalating to Claude',
       );
       return { type: 'escalate' };
     }
@@ -119,7 +132,7 @@ export async function queryLocalRouter(
     const reply = data.message?.content?.trim() ?? '';
 
     if (!reply || reply.toUpperCase() === ESCALATE_TOKEN) {
-      logger.debug('Local router: escalating to Claude');
+      logger.info({ input: plainText.slice(0, 80) }, 'Local router: escalating to Claude');
       return { type: 'escalate' };
     }
 
@@ -141,7 +154,7 @@ export async function queryLocalRouter(
     );
     return { type: 'answer', text: reply };
   } catch (err) {
-    logger.debug({ err }, 'Local router: unavailable, escalating to Claude');
+    logger.warn({ err }, 'Local router: unavailable, escalating to Claude');
     return { type: 'escalate' };
   }
 }

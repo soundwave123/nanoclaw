@@ -68,10 +68,7 @@ export async function searchWeb(query: string): Promise<string> {
     ? [SEARXNG_URL]
     : [SEARXNG_URL, ...PUBLIC_INSTANCES.filter((u) => u !== SEARXNG_URL)];
 
-  logger.info(
-    { query, instance: instancesToTry[0] },
-    'Web search via SearXNG',
-  );
+  logger.info({ query, instance: instancesToTry[0] }, 'Web search via SearXNG');
 
   let results: SearchResult[] = [];
 

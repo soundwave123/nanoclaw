@@ -208,9 +208,9 @@ class SignalChannel implements Channel {
     const isSyncSent = !!sent && !dm;
     // For sync/sent messages the chat is identified by the destination, not source
     const chatNumber = isSyncSent
-      ? ((sent!.destination as string) ||
-          (sent!.destinationNumber as string) ||
-          source)
+      ? (sent!.destination as string) ||
+        (sent!.destinationNumber as string) ||
+        source
       : source;
 
     if (!chatNumber) return;
@@ -229,7 +229,7 @@ class SignalChannel implements Channel {
         : new Date().toISOString();
 
     const effectiveSource = isSyncSent
-      ? (source || SIGNAL_PHONE_NUMBER || chatNumber)
+      ? source || SIGNAL_PHONE_NUMBER || chatNumber
       : source;
     const sourceName =
       typeof envelope.sourceName === 'string'
