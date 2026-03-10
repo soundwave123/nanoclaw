@@ -10,7 +10,13 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
-import { checkLocalRouter, LOCAL_ROUTER_ENABLED, tryLocalResponse } from './local-router.js';
+import {
+  checkLocalRouter,
+  CLAUDE_LABEL,
+  LOCAL_LABEL,
+  LOCAL_ROUTER_ENABLED,
+  queryLocalRouter,
+} from './local-router.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -68,6 +74,13 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Tracks chats waiting for a clarifying answer before escalating to Claude.
+// Maps chatJid → { originalPrompt, question }
+const pendingClarifications = new Map<
+  string,
+  { originalPrompt: string; question: string }
+>();
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -178,18 +191,48 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // --- Local router: try to handle simple messages without spawning a container ---
+  // --- Local router: classify and potentially handle without spawning a container ---
+  // claudePrompt may be overridden with enriched context when clarification was collected.
+  let claudePrompt = prompt;
+
   if (LOCAL_ROUTER_ENABLED) {
-    const localReply = await tryLocalResponse(prompt);
-    if (localReply) {
-      const channel = findChannel(channels, chatJid);
-      if (channel) {
-        await channel.sendMessage(chatJid, localReply);
+    const channel = findChannel(channels, chatJid);
+    const pending = pendingClarifications.get(chatJid);
+
+    if (pending) {
+      // User just answered a clarifying question — enrich and fall through to Claude.
+      pendingClarifications.delete(chatJid);
+      const clarifyingAnswer = missedMessages
+        .filter((m) => !m.is_from_me)
+        .map((m) => m.content)
+        .join('\n');
+      claudePrompt =
+        pending.originalPrompt +
+        `\n\n[User clarification: ${clarifyingAnswer}]`;
+      logger.info({ chatJid }, 'Local router: escalating with enriched context');
+    } else {
+      const routerResult = await queryLocalRouter(prompt);
+
+      if (routerResult.type === 'answer' && channel) {
+        await channel.sendMessage(chatJid, `${routerResult.text}\n\n${LOCAL_LABEL}`);
         lastAgentTimestamp[chatJid] =
           missedMessages[missedMessages.length - 1].timestamp;
         saveState();
         return true;
       }
+
+      if (routerResult.type === 'clarify' && channel) {
+        pendingClarifications.set(chatJid, {
+          originalPrompt: prompt,
+          question: routerResult.question,
+        });
+        await channel.sendMessage(chatJid, routerResult.question);
+        lastAgentTimestamp[chatJid] =
+          missedMessages[missedMessages.length - 1].timestamp;
+        saveState();
+        return true;
+      }
+      // type === 'escalate' → fall through to Claude below
     }
   }
 
@@ -223,7 +266,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const output = await runAgent(group, claudePrompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw =
@@ -234,7 +277,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await channel.sendMessage(chatJid, `${text}\n\n${CLAUDE_LABEL}`);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)

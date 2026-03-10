@@ -2,8 +2,11 @@
  * Local AI Router — uses Ollama to handle simple messages locally,
  * escalating to the Claude container only when needed.
  *
- * Routing decision is made by the local model itself: it either responds
- * directly (simple) or returns the special token ESCALATE (complex).
+ * The local model returns one of three responses:
+ *   - Direct answer  → handled locally, tagged "— local"
+ *   - ESCALATE       → hand off to Claude immediately
+ *   - CLARIFY: <q>   → ask the user a clarifying question first,
+ *                       then send enriched context to Claude
  */
 
 import { readEnvFile } from './env.js';
@@ -17,48 +20,70 @@ const envCfg = readEnvFile([
 ]);
 
 export const LOCAL_ROUTER_ENABLED =
-  (process.env.LOCAL_ROUTER_ENABLED || envCfg.LOCAL_ROUTER_ENABLED || 'true') === 'true';
+  (process.env.LOCAL_ROUTER_ENABLED ||
+    envCfg.LOCAL_ROUTER_ENABLED ||
+    'true') === 'true';
 
 const OLLAMA_HOST =
   process.env.OLLAMA_HOST || envCfg.OLLAMA_HOST || 'http://127.0.0.1:11434';
 
 const OLLAMA_MODEL =
-  process.env.OLLAMA_MODEL || envCfg.OLLAMA_MODEL || 'qwen2.5:7b-instruct-q4_K_M';
+  process.env.OLLAMA_MODEL ||
+  envCfg.OLLAMA_MODEL ||
+  'qwen2.5:7b-instruct-q4_K_M';
 
 const ESCALATE_TOKEN = 'ESCALATE';
+const CLARIFY_PREFIX = 'CLARIFY:';
 
-const SYSTEM_PROMPT = `You are ${ASSISTANT_NAME}, a helpful personal AI assistant. You will receive a conversation and must decide whether to answer it yourself or escalate to a more powerful AI.
+/** Label appended to every local response */
+export const LOCAL_LABEL = '— local';
+/** Label appended to every Claude response */
+export const CLAUDE_LABEL = '— Claude';
 
-RESPOND DIRECTLY if the message is:
+const SYSTEM_PROMPT = `You are ${ASSISTANT_NAME}, a helpful personal AI assistant. You receive a conversation and must decide how to respond.
+
+You have THREE options:
+
+**Option 1 — ANSWER DIRECTLY** if the message is:
 - Casual conversation, greetings, simple questions
 - Quick factual lookups you're confident about
 - Summaries, rewrites, or text formatting
 - Simple math or unit conversions
 - Short creative tasks (jokes, haiku, etc.)
+Just write your response normally.
 
-RESPOND WITH ONLY THE WORD "${ESCALATE_TOKEN}" (nothing else) if the message requires:
-- Complex multi-step reasoning or planning
+**Option 2 — ESCALATE** (respond with only the word ESCALATE, nothing else) if the message requires:
 - Writing or debugging code
 - Deep research or analysis
 - Tool use (browsing the web, managing files, scheduling tasks)
 - Any agentic task ("go do X", "set up Y", "find and fix Z")
 - Anything you're genuinely unsure about
 
-Be conservative: when in doubt, escalate. Your job is to handle the easy stuff so the powerful AI can focus on what really needs it.`;
+**Option 3 — ASK A CLARIFYING QUESTION** (respond with "CLARIFY: <your question>") when:
+- The message is clearly meant for the powerful AI (coding, research, agentic)
+- BUT a specific detail is missing that would make the answer significantly better
+- Examples: the language isn't specified for a coding task, the scope is unclear for a research task, ambiguous intent that changes the entire answer
+- Only ask ONE focused question. Don't ask if the message is already clear enough.
+
+Be conservative: when in doubt between answering and escalating, escalate.`;
 
 interface OllamaResponse {
   message?: { content?: string };
   error?: string;
 }
 
+export type RouterResult =
+  | { type: 'answer'; text: string }
+  | { type: 'clarify'; question: string }
+  | { type: 'escalate' };
+
 /**
- * Attempt to handle a message locally.
- * Returns the response text if handled, or null if it should escalate to Claude.
+ * Ask the local model what to do with this conversation.
  */
-export async function tryLocalResponse(
+export async function queryLocalRouter(
   conversationText: string,
-): Promise<string | null> {
-  if (!LOCAL_ROUTER_ENABLED) return null;
+): Promise<RouterResult> {
+  if (!LOCAL_ROUTER_ENABLED) return { type: 'escalate' };
 
   try {
     const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -67,37 +92,39 @@ export async function tryLocalResponse(
       body: JSON.stringify({
         model: OLLAMA_MODEL,
         stream: false,
-        options: {
-          temperature: 0.7,
-          num_predict: 512,
-        },
+        options: { temperature: 0.7, num_predict: 512 },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: conversationText },
         ],
       }),
-      signal: AbortSignal.timeout(15000), // 15s max for local response
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
-      logger.debug({ status: res.status }, 'Local router: Ollama returned error, escalating');
-      return null;
+      logger.debug({ status: res.status }, 'Local router: Ollama error, escalating');
+      return { type: 'escalate' };
     }
 
     const data = (await res.json()) as OllamaResponse;
     const reply = data.message?.content?.trim() ?? '';
 
-    if (!reply || reply.toUpperCase().startsWith(ESCALATE_TOKEN)) {
-      logger.debug({ reply: reply.slice(0, 50) }, 'Local router: escalating to Claude');
-      return null;
+    if (!reply || reply.toUpperCase() === ESCALATE_TOKEN) {
+      logger.debug('Local router: escalating to Claude');
+      return { type: 'escalate' };
+    }
+
+    if (reply.toUpperCase().startsWith(CLARIFY_PREFIX)) {
+      const question = reply.slice(CLARIFY_PREFIX.length).trim();
+      logger.info({ question }, 'Local router: requesting clarification');
+      return { type: 'clarify', question };
     }
 
     logger.info({ model: OLLAMA_MODEL, replyLen: reply.length }, 'Local router: handled locally');
-    return reply;
+    return { type: 'answer', text: reply };
   } catch (err) {
-    // Ollama not available or timeout — silently fall through to Claude
     logger.debug({ err }, 'Local router: unavailable, escalating to Claude');
-    return null;
+    return { type: 'escalate' };
   }
 }
 
@@ -113,12 +140,15 @@ export async function checkLocalRouter(): Promise<{
     const res = await fetch(`${OLLAMA_HOST}/api/tags`, {
       signal: AbortSignal.timeout(3000),
     });
-    if (!res.ok) return { available: false, model: OLLAMA_MODEL, error: `HTTP ${res.status}` };
+    if (!res.ok)
+      return { available: false, model: OLLAMA_MODEL, error: `HTTP ${res.status}` };
 
     const data = (await res.json()) as { models?: { name: string }[] };
     const models = data.models ?? [];
     const hasModel = models.some(
-      (m) => m.name === OLLAMA_MODEL || m.name.startsWith(OLLAMA_MODEL.split(':')[0]),
+      (m) =>
+        m.name === OLLAMA_MODEL ||
+        m.name.startsWith(OLLAMA_MODEL.split(':')[0]),
     );
 
     if (!hasModel) {
