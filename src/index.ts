@@ -17,6 +17,7 @@ import {
   LOCAL_ROUTER_ENABLED,
   queryLocalRouter,
 } from './local-router.js';
+import { searchWeb } from './web-search.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -209,16 +210,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       claudePrompt =
         pending.originalPrompt +
         `\n\n[User clarification: ${clarifyingAnswer}]`;
-      logger.info({ chatJid }, 'Local router: escalating with enriched context');
+      logger.info(
+        { chatJid },
+        'Local router: escalating with enriched context',
+      );
     } else {
       const routerResult = await queryLocalRouter(prompt);
 
       if (routerResult.type === 'answer' && channel) {
-        await channel.sendMessage(chatJid, `${routerResult.text}\n\n${LOCAL_LABEL}`);
+        await channel.sendMessage(
+          chatJid,
+          `${routerResult.text}\n\n${LOCAL_LABEL}`,
+        );
         lastAgentTimestamp[chatJid] =
           missedMessages[missedMessages.length - 1].timestamp;
         saveState();
         return true;
+      }
+
+      if (routerResult.type === 'search') {
+        // Search the web locally then hand enriched context to Claude
+        const searchContext = await searchWeb(routerResult.query);
+        if (searchContext) {
+          claudePrompt = searchContext + '\n\n' + prompt;
+          logger.info(
+            { query: routerResult.query },
+            'Local router: enriched prompt with web results',
+          );
+        }
+        // Fall through to Claude with enriched context
       }
 
       if (routerResult.type === 'clarify' && channel) {
@@ -232,7 +252,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         saveState();
         return true;
       }
-      // type === 'escalate' → fall through to Claude below
+      // type === 'escalate' or 'search' → fall through to Claude below
     }
   }
 
@@ -266,32 +286,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, claudePrompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, `${text}\n\n${CLAUDE_LABEL}`);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    claudePrompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, `${text}\n\n${CLAUDE_LABEL}`);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);

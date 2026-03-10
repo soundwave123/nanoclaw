@@ -34,6 +34,7 @@ const OLLAMA_MODEL =
 
 const ESCALATE_TOKEN = 'ESCALATE';
 const CLARIFY_PREFIX = 'CLARIFY:';
+const SEARCH_PREFIX = 'SEARCH:';
 
 /** Label appended to every local response */
 export const LOCAL_LABEL = '— local';
@@ -52,20 +53,24 @@ You have THREE options:
 - Short creative tasks (jokes, haiku, etc.)
 Just write your response normally.
 
-**Option 2 — ESCALATE** (respond with only the word ESCALATE, nothing else) if the message requires:
+**Option 2 — WEB SEARCH THEN ESCALATE** (respond with "SEARCH: <optimal search query>") when:
+- The message asks about current events, news, prices, weather, or anything time-sensitive
+- The message asks for facts you're not confident about
+- Research or analysis would clearly benefit from fresh web results
+- Choose the most effective search query to get useful results
+
+**Option 3 — ESCALATE** (respond with only the word ESCALATE, nothing else) if the message requires:
 - Writing or debugging code
-- Deep research or analysis
-- Tool use (browsing the web, managing files, scheduling tasks)
-- Any agentic task ("go do X", "set up Y", "find and fix Z")
-- Anything you're genuinely unsure about
+- Deep multi-step reasoning or planning
+- Tool use (managing files, scheduling tasks, agentic tasks like "go do X")
+- Anything that doesn't need web context and is beyond your capability
 
-**Option 3 — ASK A CLARIFYING QUESTION** (respond with "CLARIFY: <your question>") when:
-- The message is clearly meant for the powerful AI (coding, research, agentic)
-- BUT a specific detail is missing that would make the answer significantly better
-- Examples: the language isn't specified for a coding task, the scope is unclear for a research task, ambiguous intent that changes the entire answer
-- Only ask ONE focused question. Don't ask if the message is already clear enough.
+**Option 4 — ASK A CLARIFYING QUESTION** (respond with "CLARIFY: <your question>") when:
+- The task clearly needs the powerful AI, BUT a specific detail is missing
+- Examples: language not specified for a coding task, ambiguous scope
+- Only ask ONE focused question. Don't ask if the message is already clear.
 
-Be conservative: when in doubt between answering and escalating, escalate.`;
+Be conservative: when in doubt between answering and searching, search. When in doubt between searching and escalating, search first.`;
 
 interface OllamaResponse {
   message?: { content?: string };
@@ -74,6 +79,7 @@ interface OllamaResponse {
 
 export type RouterResult =
   | { type: 'answer'; text: string }
+  | { type: 'search'; query: string }
   | { type: 'clarify'; question: string }
   | { type: 'escalate' };
 
@@ -102,7 +108,10 @@ export async function queryLocalRouter(
     });
 
     if (!res.ok) {
-      logger.debug({ status: res.status }, 'Local router: Ollama error, escalating');
+      logger.debug(
+        { status: res.status },
+        'Local router: Ollama error, escalating',
+      );
       return { type: 'escalate' };
     }
 
@@ -114,13 +123,22 @@ export async function queryLocalRouter(
       return { type: 'escalate' };
     }
 
+    if (reply.toUpperCase().startsWith(SEARCH_PREFIX)) {
+      const query = reply.slice(SEARCH_PREFIX.length).trim();
+      logger.info({ query }, 'Local router: web search before escalating');
+      return { type: 'search', query };
+    }
+
     if (reply.toUpperCase().startsWith(CLARIFY_PREFIX)) {
       const question = reply.slice(CLARIFY_PREFIX.length).trim();
       logger.info({ question }, 'Local router: requesting clarification');
       return { type: 'clarify', question };
     }
 
-    logger.info({ model: OLLAMA_MODEL, replyLen: reply.length }, 'Local router: handled locally');
+    logger.info(
+      { model: OLLAMA_MODEL, replyLen: reply.length },
+      'Local router: handled locally',
+    );
     return { type: 'answer', text: reply };
   } catch (err) {
     logger.debug({ err }, 'Local router: unavailable, escalating to Claude');
@@ -141,7 +159,11 @@ export async function checkLocalRouter(): Promise<{
       signal: AbortSignal.timeout(3000),
     });
     if (!res.ok)
-      return { available: false, model: OLLAMA_MODEL, error: `HTTP ${res.status}` };
+      return {
+        available: false,
+        model: OLLAMA_MODEL,
+        error: `HTTP ${res.status}`,
+      };
 
     const data = (await res.json()) as { models?: { name: string }[] };
     const models = data.models ?? [];
