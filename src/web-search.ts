@@ -1,19 +1,29 @@
 /**
  * Web search for the local router pre-retrieval step.
  *
- * Priority:
- *   1. Brave Search API  (if BRAVE_SEARCH_API_KEY is set — best quality)
- *   2. DuckDuckGo HTML scrape  (free fallback, no key needed)
+ * Uses SearXNG — free, open-source, privacy-respecting meta-search engine.
+ * No API key required. Configure SEARXNG_URL to point to your own instance
+ * (recommended) or leave unset to use a public instance.
  *
- * Returns a short text block of search results to append to the Claude prompt.
+ * To run your own local instance:
+ *   docker run -d -p 8080:8080 searxng/searxng
+ *   Then add SEARXNG_URL=http://localhost:8080 to .env
  */
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
-const envCfg = readEnvFile(['BRAVE_SEARCH_API_KEY']);
-const BRAVE_KEY =
-  process.env.BRAVE_SEARCH_API_KEY || envCfg.BRAVE_SEARCH_API_KEY || '';
+const envCfg = readEnvFile(['SEARXNG_URL']);
+
+// Public SearXNG instances — tried in order on failure
+const PUBLIC_INSTANCES = [
+  'https://searx.be',
+  'https://searxng.world',
+  'https://paulgo.io',
+];
+
+const SEARXNG_URL =
+  process.env.SEARXNG_URL || envCfg.SEARXNG_URL || PUBLIC_INSTANCES[0];
 
 const MAX_RESULTS = 5;
 const SEARCH_TIMEOUT_MS = 10000;
@@ -24,98 +34,54 @@ export interface SearchResult {
   snippet: string;
 }
 
-// ---------------------------------------------------------------------------
-// Brave Search API
-// ---------------------------------------------------------------------------
-
-async function braveSearch(query: string): Promise<SearchResult[]> {
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${MAX_RESULTS}`;
-  const res = await fetch(url, {
-    headers: {
-      Accept: 'application/json',
-      'Accept-Encoding': 'gzip',
-      'X-Subscription-Token': BRAVE_KEY,
-    },
-    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`Brave Search HTTP ${res.status}`);
-  const data = (await res.json()) as {
-    web?: { results?: { title: string; url: string; description?: string }[] };
-  };
-  return (data.web?.results ?? []).map((r) => ({
-    title: r.title,
-    url: r.url,
-    snippet: r.description ?? '',
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// DuckDuckGo HTML scrape
-// ---------------------------------------------------------------------------
-
-async function duckduckgoSearch(query: string): Promise<SearchResult[]> {
-  // Use DDG lite HTML — no JS required, parses cleanly
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+async function searxngSearch(
+  query: string,
+  baseUrl: string,
+): Promise<SearchResult[]> {
+  const url = `${baseUrl}/search?q=${encodeURIComponent(query)}&format=json&language=en`;
   const res = await fetch(url, {
     headers: {
       'User-Agent':
         'Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0',
+      Accept: 'application/json',
     },
     signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`DDG HTTP ${res.status}`);
-  const html = await res.text();
-
-  const results: SearchResult[] = [];
-
-  // Extract result blocks: each result has a title link and a snippet
-  const resultBlockRegex =
-    /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-
-  let match: RegExpExecArray | null;
-  while ((match = resultBlockRegex.exec(html)) !== null && results.length < MAX_RESULTS) {
-    const url = match[1];
-    const title = match[2].replace(/<[^>]+>/g, '').trim();
-    const snippet = match[3].replace(/<[^>]+>/g, '').trim();
-    if (url && title) {
-      results.push({ title, url, snippet });
-    }
-  }
-
-  // Fallback: simpler extraction if regex above yields nothing
-  if (results.length === 0) {
-    const titleRegex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    while ((match = titleRegex.exec(html)) !== null && results.length < MAX_RESULTS) {
-      const url = match[1];
-      const title = match[2].replace(/<[^>]+>/g, '').trim();
-      if (url && title && url.startsWith('http')) {
-        results.push({ title, url, snippet: '' });
-      }
-    }
-  }
-
-  return results;
+  if (!res.ok) throw new Error(`SearXNG HTTP ${res.status} from ${baseUrl}`);
+  const data = (await res.json()) as {
+    results?: { title: string; url: string; content?: string }[];
+  };
+  return (data.results ?? []).slice(0, MAX_RESULTS).map((r) => ({
+    title: r.title,
+    url: r.url,
+    snippet: r.content ?? '',
+  }));
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /**
- * Search the web and return a formatted context block for inclusion in a prompt.
+ * Search the web via SearXNG and return a formatted context block.
+ * Falls back through public instances if the configured one fails.
  */
 export async function searchWeb(query: string): Promise<string> {
-  logger.info({ query, engine: BRAVE_KEY ? 'brave' : 'duckduckgo' }, 'Web search');
+  const isCustom = !!(envCfg.SEARXNG_URL || process.env.SEARXNG_URL);
+  const instancesToTry = isCustom
+    ? [SEARXNG_URL]
+    : [SEARXNG_URL, ...PUBLIC_INSTANCES.filter((u) => u !== SEARXNG_URL)];
+
+  logger.info(
+    { query, instance: instancesToTry[0] },
+    'Web search via SearXNG',
+  );
 
   let results: SearchResult[] = [];
 
-  try {
-    results = BRAVE_KEY
-      ? await braveSearch(query)
-      : await duckduckgoSearch(query);
-  } catch (err) {
-    logger.warn({ err, query }, 'Web search failed');
-    return '';
+  for (const instance of instancesToTry) {
+    try {
+      results = await searxngSearch(query, instance);
+      if (results.length > 0) break;
+    } catch (err) {
+      logger.warn({ err, instance }, 'SearXNG instance failed, trying next');
+    }
   }
 
   if (results.length === 0) {
