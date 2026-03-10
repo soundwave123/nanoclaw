@@ -10,6 +10,7 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { checkLocalRouter, LOCAL_ROUTER_ENABLED, tryLocalResponse } from './local-router.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -176,6 +177,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
+
+  // --- Local router: try to handle simple messages without spawning a container ---
+  if (LOCAL_ROUTER_ENABLED) {
+    const localReply = await tryLocalResponse(prompt);
+    if (localReply) {
+      const channel = findChannel(channels, chatJid);
+      if (channel) {
+        await channel.sendMessage(chatJid, localReply);
+        lastAgentTimestamp[chatJid] =
+          missedMessages[missedMessages.length - 1].timestamp;
+        saveState();
+        return true;
+      }
+    }
+  }
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -470,6 +486,19 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Check local router availability at startup
+  if (LOCAL_ROUTER_ENABLED) {
+    const routerStatus = await checkLocalRouter();
+    if (routerStatus.available) {
+      logger.info({ model: routerStatus.model }, 'Local router: available');
+    } else {
+      logger.warn(
+        { model: routerStatus.model, error: routerStatus.error },
+        'Local router: unavailable (will use Claude for all messages)',
+      );
+    }
+  }
 
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(
