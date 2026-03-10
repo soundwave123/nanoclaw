@@ -18,7 +18,8 @@ const SIGNAL_CLI_SOCKET =
   process.env.SIGNAL_CLI_SOCKET ||
   envCfg.SIGNAL_CLI_SOCKET ||
   '/var/run/signal-cli/socket';
-const SIGNAL_CLI_USE_SOCKET = !!envCfg.SIGNAL_CLI_SOCKET || !!process.env.SIGNAL_CLI_SOCKET;
+const SIGNAL_CLI_USE_SOCKET =
+  !!envCfg.SIGNAL_CLI_SOCKET || !!process.env.SIGNAL_CLI_SOCKET;
 const SIGNAL_CLI_TCP_HOST =
   process.env.SIGNAL_CLI_TCP_HOST || envCfg.SIGNAL_CLI_TCP_HOST || '127.0.0.1';
 const SIGNAL_CLI_TCP_PORT = parseInt(
@@ -29,6 +30,7 @@ const SIGNAL_CLI_TCP_PORT = parseInt(
 const JID_PREFIX = 'signal:';
 const RECONNECT_DELAY_MS = 5000;
 const MAX_RECONNECT_DELAY_MS = 60000;
+const POLL_INTERVAL_MS = 2000;
 
 function toJid(identifier: string): string {
   return `${JID_PREFIX}${identifier}`;
@@ -51,6 +53,7 @@ class SignalChannel implements Channel {
   >();
   private reconnectDelay = RECONNECT_DELAY_MS;
   private intentionalDisconnect = false;
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
 
   private onMessage: OnInboundMessage;
   private onChatMetadata: OnChatMetadata;
@@ -72,7 +75,10 @@ class SignalChannel implements Channel {
 
       const connectOpts: net.NetConnectOpts = SIGNAL_CLI_USE_SOCKET
         ? ({ path: SIGNAL_CLI_SOCKET } as net.IpcNetConnectOpts)
-        : ({ host: SIGNAL_CLI_TCP_HOST, port: SIGNAL_CLI_TCP_PORT } as net.TcpNetConnectOpts);
+        : ({
+            host: SIGNAL_CLI_TCP_HOST,
+            port: SIGNAL_CLI_TCP_PORT,
+          } as net.TcpNetConnectOpts);
 
       logger.info({ connectOpts }, 'Signal: connecting to signal-cli daemon');
 
@@ -81,7 +87,10 @@ class SignalChannel implements Channel {
         this._connected = true;
         this.reconnectDelay = RECONNECT_DELAY_MS;
         this.subscribeReceive()
-          .then(resolve)
+          .then(() => {
+            this.startPolling();
+            resolve();
+          })
           .catch((err) => {
             logger.error({ err }, 'Signal: subscribeReceive failed');
             reject(err);
@@ -183,37 +192,58 @@ class SignalChannel implements Channel {
   }
 
   private handleEnvelope(envelope: Record<string, unknown>): void {
+    // Regular incoming message from another party
     const dm = envelope.dataMessage as Record<string, unknown> | undefined;
-    if (!dm?.message || typeof dm.message !== 'string') return;
+    // Sync message: copy of a message sent from the primary device
+    const sync = envelope.syncMessage as Record<string, unknown> | undefined;
+    const sent = sync?.sentMessage as Record<string, unknown> | undefined;
+
+    // Resolve message body from whichever field is present
+    const msgBody = dm ?? sent;
+    if (!msgBody?.message || typeof msgBody.message !== 'string') return;
 
     const source =
-      (envelope.source as string) ||
-      (envelope.sourceNumber as string) ||
-      '';
-    if (!source) return;
+      (envelope.source as string) || (envelope.sourceNumber as string) || '';
 
-    const groupInfo = dm.groupInfo as Record<string, unknown> | undefined;
+    const isSyncSent = !!sent && !dm;
+    // For sync/sent messages the chat is identified by the destination, not source
+    const chatNumber = isSyncSent
+      ? ((sent!.destination as string) ||
+          (sent!.destinationNumber as string) ||
+          source)
+      : source;
+
+    if (!chatNumber) return;
+
+    const groupInfo = msgBody.groupInfo as Record<string, unknown> | undefined;
     const groupId =
       typeof groupInfo?.groupId === 'string' ? groupInfo.groupId : null;
 
-    const jid = groupId ? toJid(`group.${groupId}`) : toJid(source);
-    const tsRaw = envelope.timestamp;
+    const jid = groupId ? toJid(`group.${groupId}`) : toJid(chatNumber);
+    const tsRaw =
+      (envelope.timestamp as number | undefined) ??
+      (sent?.timestamp as number | undefined);
     const timestamp =
       typeof tsRaw === 'number'
         ? new Date(tsRaw).toISOString()
         : new Date().toISOString();
 
+    const effectiveSource = isSyncSent
+      ? (source || SIGNAL_PHONE_NUMBER || chatNumber)
+      : source;
     const sourceName =
-      typeof envelope.sourceName === 'string' ? envelope.sourceName : source;
-    const isFromMe = source === SIGNAL_PHONE_NUMBER;
+      typeof envelope.sourceName === 'string'
+        ? envelope.sourceName
+        : effectiveSource;
+    const isFromMe = isSyncSent || effectiveSource === SIGNAL_PHONE_NUMBER;
 
     this.onChatMetadata(jid, timestamp, undefined, 'signal', !!groupId);
     this.onMessage(jid, {
-      id: `signal_${tsRaw ?? Date.now()}_${source}`,
+      id: `signal_${tsRaw ?? Date.now()}_${effectiveSource}`,
       chat_jid: jid,
-      sender: source,
+      sender: effectiveSource,
       sender_name: sourceName,
-      content: dm.message,
+      content: msgBody.message,
       timestamp,
       is_from_me: isFromMe,
     });
@@ -238,6 +268,31 @@ class SignalChannel implements Channel {
     logger.info('Signal: subscribed to incoming messages');
   }
 
+  private startPolling(): void {
+    // Poll via receive RPC to capture sync messages (Note to Self, etc.)
+    // that signal-cli doesn't push via subscribeReceive notifications.
+    const poll = async () => {
+      if (this.intentionalDisconnect || !this._connected) return;
+      try {
+        const result = await this.rpc('receive', {
+          account: SIGNAL_PHONE_NUMBER,
+        });
+        if (Array.isArray(result)) {
+          for (const item of result) {
+            const env = (item as Record<string, unknown>).envelope;
+            if (env) this.handleEnvelope(env as Record<string, unknown>);
+          }
+        }
+      } catch {
+        // ignore poll errors — socket close already handles reconnect
+      }
+      if (!this.intentionalDisconnect) {
+        this.pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
+      }
+    };
+    this.pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     const identifier = fromJid(jid);
     const isGroup = identifier.startsWith('group.');
@@ -257,6 +312,7 @@ class SignalChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.socket?.destroy();
     this._connected = false;
   }
